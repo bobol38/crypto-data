@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Récupère le MVRV de BTC (Coin Metrics, API communautaire gratuite, sans clé),
+"""Récupère le MVRV et le prix de BTC (Coin Metrics, API communautaire gratuite, sans clé)
+et l'indice Fear & Greed (Alternative.me, sans clé),
 construit un récapitulatif automatique par règles (sans IA) et écrit data/mvrv.json.
 Si data/others.json existe (créé par fetch_others.py), le récap commente aussi BTC et OTHERS."""
 import json, os, time, urllib.request, urllib.error, urllib.parse
@@ -7,6 +8,9 @@ from datetime import datetime, timezone
 
 API = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
 START = "2017-01-01"
+FNG_URL = "https://api.alternative.me/fng/?limit=90&format=json"
+FNG_FR = {"Extreme Fear": "peur extrême", "Fear": "peur", "Neutral": "neutre",
+          "Greed": "cupidité", "Extreme Greed": "cupidité extrême"}
 
 
 def get(url):
@@ -28,7 +32,7 @@ def get(url):
 
 
 def fetch_mvrv():
-    params = {"assets": "btc", "metrics": "CapMVRVCur", "frequency": "1d",
+    params = {"assets": "btc", "metrics": "CapMVRVCur,PriceUSD", "frequency": "1d",
               "start_time": START, "page_size": 10000}
     url = f"{API}?{urllib.parse.urlencode(params)}"
     rows = []
@@ -36,10 +40,32 @@ def fetch_mvrv():
         j = get(url)
         rows += j.get("data", [])
         url = j.get("next_page_url")
-    out = [(r["time"][:10], float(r["CapMVRVCur"])) for r in rows
-           if r.get("CapMVRVCur") not in (None, "")]
+    out = []
+    for r in rows:
+        if r.get("CapMVRVCur") in (None, ""):
+            continue
+        try:
+            price = float(r.get("PriceUSD")) if r.get("PriceUSD") not in (None, "") else None
+        except ValueError:
+            price = None
+        out.append((r["time"][:10], float(r["CapMVRVCur"]), price))
     out.sort()
-    return [d for d, _ in out], [v for _, v in out]
+    return [o[0] for o in out], [o[1] for o in out], [o[2] for o in out]
+
+
+def fetch_fng():
+    """Indice Fear & Greed des 90 derniers jours (du plus ancien au plus récent). Ne bloque jamais le reste."""
+    try:
+        j = get(FNG_URL)
+        vals = []
+        for it in j.get("data", []):
+            d = datetime.fromtimestamp(int(it["timestamp"]), timezone.utc).strftime("%Y-%m-%d")
+            vals.append({"d": d, "v": int(it["value"]), "c": it.get("value_classification", "")})
+        vals.sort(key=lambda x: x["d"])
+        return vals
+    except Exception as e:
+        print(f"  Fear & Greed indisponible : {e}")
+        return []
 
 
 def fr(x, d=1, sign=False):
@@ -67,7 +93,7 @@ def load_market():
         return None, None
 
 
-def build_recap(dates, vals, btc=None, oth=None):
+def build_recap(dates, vals, btc=None, oth=None, fng=None):
     v = vals[-1]
     d7, d30 = change(vals, 7), change(vals, 30)
     pctile = sum(1 for x in vals if x <= v) / len(vals) * 100
@@ -97,19 +123,28 @@ def build_recap(dates, vals, btc=None, oth=None):
         o30, b30 = change(oth, 30), change(btc, 30)
         L.append(f"OTHERS (estimé) : {fr(o30, 1, True)} % sur 30 jours, soit "
                  f"{fr(abs(o30 - b30), 1)} points de {'mieux' if o30 >= b30 else 'moins bien'} que BTC.")
+    if fng:
+        cur = fng[-1]
+        txt = f"Indice Fear & Greed : {cur['v']} ({FNG_FR.get(cur['c'], cur['c'].lower())})"
+        if len(fng) > 7:
+            txt += f", contre {fng[-8]['v']} il y a 7 jours"
+        L.append(txt + ".")
     L.append("Résumé généré automatiquement par règles, sans IA. Repères historiques, pas un conseil en investissement.")
     return {"titre": f"Récapitulatif du {dates[-1][8:]}/{dates[-1][5:7]}/{dates[-1][:4]}", "lignes": L}, stats
 
 
 def main():
-    dates, vals = fetch_mvrv()
+    dates, vals, prices = fetch_mvrv()
     if len(dates) < 100:
         raise SystemExit("Données insuffisantes, rien n'est écrit.")
     btc, oth = load_market()
-    recap, stats = build_recap(dates, vals, btc, oth)
+    fng = fetch_fng()
+    recap, stats = build_recap(dates, vals, btc, oth, fng)
     result = {"source": "Coin Metrics (API communautaire)",
               "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
               "dates": dates, "mvrv": [round(v, 3) for v in vals],
+              "btc": [round(p, 2) if p else None for p in prices],
+              "fng": {"source": "Alternative.me", "values": fng},
               "stats": stats, "recap": recap}
     os.makedirs("data", exist_ok=True)
     with open("data/mvrv.json", "w", encoding="utf-8") as f:
